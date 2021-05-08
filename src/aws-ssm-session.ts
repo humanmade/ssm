@@ -61,7 +61,9 @@ export default class AWSSSMSession {
 				case 'channel_closed': {
 					if ( message.Payload ) {
 						const payloadData = JSON.parse( message.Payload );
-						this.emit( 'output', payloadData.Output + '\r\n' );
+						if ( payloadData.Output.length > 0 ) {
+							this.emit( 'output', payloadData.Output + '\r\n' );
+						}
 					}
 					this.connectionTerminated = true;
 					break;
