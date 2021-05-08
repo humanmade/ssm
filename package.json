@@ -1,6 +1,7 @@
 {
   "name": "@humanmade/ssm",
   "version": "0.0.1",
+  "license": "Apache-2.0",
   "dependencies": {
     "isomorphic-ws": "^4.0.1",
     "js-sha256": "^0.9.0",
