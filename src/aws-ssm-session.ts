@@ -28,7 +28,7 @@ export default class AWSSSMSession {
 		this.sessionId = sessionId;
 		this.webSocket = new WebSocket(this.streamUrl);
 		this.webSocket.binaryType = 'arraybuffer';
-		this.webSocket.onopen = (ev: Event) => {
+		this.webSocket.onopen = (ev: WebSocket.OpenEvent) => {
 			this.webSocket.send(
 				JSON.stringify({
 					MessageSchemaVersion: '1.0',
@@ -55,9 +55,6 @@ export default class AWSSSMSession {
 					break
 				}
 				case 'start_publication': {
-					if ( this.paused === false ) {
-						console.log( 'Session recieved start_publication message when the connection was not paused.' );
-					}
 					if ( this.lastAcknowledgedSequenceNumber !== undefined ) {
 						this.outgoingSequenceNumber = this.lastAcknowledgedSequenceNumber;
 					} else {
@@ -70,7 +67,6 @@ export default class AWSSSMSession {
 				case 'pause_publication': {
 					this.paused = true;
 					this.emit( 'pause', '' );
-					console.warn( 'Recieved pause_publication message, all sent messages may be discarded until start_publication is recieved.' );
 					break;
 				}
 				case 'acknowledge': {
