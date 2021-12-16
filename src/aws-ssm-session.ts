@@ -5,7 +5,7 @@ import { decode, encode, EncodeableAgentMessage } from './agent-message';
 import { MessageType, PayloadType } from './channel-messages';
 
 interface Handler {
-	event: 'output' | 'connect' | 'disconnect',
+	event: 'output' | 'connect' | 'disconnect' | 'pause' | 'resume',
 	callback: Function
 }
 
@@ -14,11 +14,22 @@ export default class AWSSSMSession {
 	sessionId: string;
 	tokenValue: string;
 	streamUrl: string;
+	// Each message that is sent to the SSM websocket is assigned a sequenceNumber
+	// so the receiver can verify it has not missed any messages (sequenceNumber is
+	// an incrementing integer). Also, messages can be ordered back into sequence if
+	// anything were to get ahead of line.
 	outgoingSequenceNumber = 0;
 	outputMap = new Map();
 	connectionClosed = false;
 	connectionTerminated = false;
+	// Each message that is sent with a sequenceNumber is replied to with an
+	// acknowledgement from the SSM remote agent. We keep track of the latest
+	// sequenceNumber that has been acknowledged, so we know what number to reset
+	// to if we fall out of sync with the remove server. Currently no buffering or
+	// replaying of messages exists, but it could be added in the future.
+	lastAcknowledgedSequenceNumber: number | undefined;
 	handlers: Handler[] = [];
+	paused: boolean = false;
 
 	constructor( streamUrl: string, sessionId: string, tokenValue: string ) {
 		this.streamUrl = streamUrl;
@@ -26,7 +37,7 @@ export default class AWSSSMSession {
 		this.sessionId = sessionId;
 		this.webSocket = new WebSocket(this.streamUrl);
 		this.webSocket.binaryType = 'arraybuffer';
-		this.webSocket.onopen = (ev: Event) => {
+		this.webSocket.onopen = (ev: WebSocket.OpenEvent) => {
 			this.webSocket.send(
 				JSON.stringify({
 					MessageSchemaVersion: '1.0',
@@ -52,10 +63,31 @@ export default class AWSSSMSession {
 					this.outputMap.set(message.MessageId, text);
 					break
 				}
-				case 'input_stream_data':
-				case 'start_publication':
-				case 'pause_publication':
+				case 'start_publication': {
+					if ( this.lastAcknowledgedSequenceNumber !== undefined ) {
+						this.outgoingSequenceNumber = this.lastAcknowledgedSequenceNumber;
+					} else {
+						this.outgoingSequenceNumber = 0;
+					}
+					this.paused = false;
+					this.emit( 'resume', '' );
+					break;
+				}
+				case 'pause_publication': {
+					this.paused = true;
+					this.emit( 'pause', '' );
+					break;
+				}
 				case 'acknowledge': {
+					if ( message.Payload ) {
+						const payloadData = JSON.parse( message.Payload );
+						if ( this.lastAcknowledgedSequenceNumber === undefined || this.lastAcknowledgedSequenceNumber < payloadData.AcknowledgedMessageSequenceNumber ) {
+							this.lastAcknowledgedSequenceNumber = payloadData.AcknowledgedMessageSequenceNumber;
+						}
+					}
+					break;
+				}
+				case 'input_stream_data': {
 					break;
 				}
 				case 'channel_closed': {
@@ -82,11 +114,15 @@ export default class AWSSSMSession {
 	}
 
 	send( message: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView | Blob ) {
+		if ( this.webSocket.readyState !== 1 ) {
+			console.warn( 'WebSocket is not yet ready.' );
+			return;
+		}
 		this.outgoingSequenceNumber++;
 		this.webSocket.send( message )
 	}
 
-	on( eventName: 'output' | 'connect' | 'disconnect', callback: Function ) {
+	on( eventName: 'output' | 'connect' | 'disconnect' | 'pause' | 'resume', callback: Function ) {
 		this.handlers.push( {
 			event: eventName,
 			callback,
@@ -107,7 +143,7 @@ export default class AWSSSMSession {
 		this.webSocket.send( 'ping' );
 	}
 
-	emit( eventName: 'output' | 'connect' | 'disconnect', data: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView | Blob ) {
+	emit( eventName: 'output' | 'connect' | 'disconnect' | 'pause' | 'resume', data: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView | Blob ) {
 		this.handlers.filter( h => h.event === eventName ).map( h => h.callback( data ) );
 	}
 
