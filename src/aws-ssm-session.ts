@@ -14,10 +14,19 @@ export default class AWSSSMSession {
 	sessionId: string;
 	tokenValue: string;
 	streamUrl: string;
+	// Each message that is sent to the SSM websocket is assigned a sequenceNumber
+	// so the receiver can verify it has not missed any messages (sequenceNumber is
+	// an incrementing integer). Also, messages can be ordered back into sequence if
+	// anything were to get ahead of line.
 	outgoingSequenceNumber = 0;
 	outputMap = new Map();
 	connectionClosed = false;
 	connectionTerminated = false;
+	// Each message that is sent with a sequenceNumber is replied to with an
+	// acknowledgement from the SSM remote agent. We keep track of the latest
+	// sequenceNumber that has been acknowledged, so we know what number to reset
+	// to if we fall out of sync with the remove server. Currently no buffering or
+	// replaying of messages exists, but it could be added in the future.
 	lastAcknowledgedSequenceNumber: number | undefined;
 	handlers: Handler[] = [];
 	paused: boolean = false;
