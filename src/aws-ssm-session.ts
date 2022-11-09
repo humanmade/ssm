@@ -37,6 +37,7 @@ export default class AWSSSMSession {
 	// anything were to get ahead of line.
 	outgoingSequenceNumber = 0;
 	outputMap = new Map();
+	didAck: { [ k: string ]: boolean } = {};
 	connectionClosed = false;
 	connectionTerminated = false;
 	// Each message that is sent with a sequenceNumber is replied to with an
@@ -73,6 +74,10 @@ export default class AWSSSMSession {
 
 			switch( message.MessageType ) {
 				case 'output_stream_data': {
+					if ( this.didAck[ message.MessageId ] ) {
+						this.logger.debug( 'dupe', message.MessageId );
+						return;
+					}
 					this.logger.debug( 'recv', message );
 					this.acknowledgeMessage( message.MessageType, message.MessageId, message.SequenceNumber );
 
@@ -236,6 +241,11 @@ export default class AWSSSMSession {
 	}
 
 	private acknowledgeMessage( messageType: MessageType, messageId: string, messageSequenceNumber: number ) {
+		if ( this.didAck[ messageId ] ) {
+			return;
+		}
+		this.didAck[ messageId ] = true;
+
 		const encoder = new TextEncoder();
 		const message: EncodeableAgentMessage = {
 			MessageType: MessageType.AcknowledgeMessage,
