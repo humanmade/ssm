@@ -3,9 +3,12 @@ import WebSocket from 'isomorphic-ws';
 
 import { decode, encode, EncodeableAgentMessage } from './agent-message';
 import { MessageType, PayloadType } from './channel-messages';
+import { HandshakeResponsePayload } from './handshake';
+
+export { decode } from './agent-message';
 
 interface Handler {
-	event: 'output' | 'connect' | 'disconnect' | 'pause' | 'resume',
+	event: 'output' | 'rawOutput' | 'connect' | 'disconnect' | 'pause' | 'resume' | 'handshake' | 'handshakeComplete',
 	callback: Function
 }
 
@@ -76,9 +79,30 @@ export default class AWSSSMSession {
 					const decoder = new TextDecoder( 'utf8' );
 					const text = decoder.decode( message.Payload );
 					if ( ! this.outputMap.has( message.MessageId ) ) {
-						this.logger.debug( 'output', message.Payload );
-						this.emit( 'output', text );
+						switch ( message.PayloadType ) {
+							case PayloadType.Output:
+								this.logger.debug( 'output', message.Payload );
+								this.emit( 'output', text );
+								this.emit( 'rawOutput', message.Payload );
+								break;
+
+							case PayloadType.HandshakeRequest:
+								this.logger.debug( 'handshake', JSON.parse( text ) );
+								this.emit( 'handshake', JSON.parse( text ) );
+								break;
+
+							case PayloadType.HandshakeComplete:
+								this.logger.debug( 'handshakeComplete', JSON.parse( text ) );
+								this.emit( 'handshakeComplete', JSON.parse( text ) );
+								break;
+
+							default:
+								this.logger.warn( `No handler for ${ message.PayloadType }` );
+								this.logger.debug( 'badType', text );
+								break;
+						}
 					}
+
 					this.outputMap.set(message.MessageId, text);
 					break
 				}
@@ -145,7 +169,7 @@ export default class AWSSSMSession {
 		this.webSocket.send( message );
 	}
 
-	on( eventName: 'output' | 'connect' | 'disconnect' | 'pause' | 'resume', callback: Function ) {
+	on( eventName: Handler['event'], callback: Function ) {
 		this.handlers.push( {
 			event: eventName,
 			callback,
@@ -175,12 +199,24 @@ export default class AWSSSMSession {
 		this.send( encode( data ) );
 	}
 
+	sendHandshakeResponse( payload: HandshakeResponsePayload ) {
+		const encoder = new TextEncoder();
+		const data = {
+			MessageType: MessageType.InputStreamDataMessage,
+			SequenceNumber: this.outgoingSequenceNumber,
+			Payload: encoder.encode( JSON.stringify( payload ) ),
+			PayloadType: PayloadType.HandshakeResponse,
+		};
+		this.logger.debug( 'sendHandshakeResponse', data );
+		this.send( encode( data ) );
+	}
+
 	ping() {
 		this.logger.debug( 'ping' );
 		this.webSocket.send( 'ping' );
 	}
 
-	emit( eventName: 'output' | 'connect' | 'disconnect' | 'pause' | 'resume', data: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView | Blob ) {
+	emit( eventName: Handler['event'], data: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView | Blob ) {
 		this.handlers.filter( h => h.event === eventName ).map( h => h.callback( data ) );
 	}
 
