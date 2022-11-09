@@ -9,6 +9,20 @@ interface Handler {
 	callback: Function
 }
 
+interface Logger {
+	debug( type: string, ...args: any[] ): void,
+	info( type: string, ...args: any[] ): void,
+	warn( type: string, ...args: any[] ): void,
+	error( type: string, ...args: any[] ): void,
+}
+
+class NullLogger implements Logger {
+	debug(): void {}
+	info(): void {}
+	warn(): void {}
+	error(): void {}
+}
+
 export default class AWSSSMSession {
 	webSocket: WebSocket;
 	sessionId: string;
@@ -30,11 +44,13 @@ export default class AWSSSMSession {
 	lastAcknowledgedSequenceNumber: number | undefined;
 	handlers: Handler[] = [];
 	paused: boolean = false;
+	logger: Logger;
 
-	constructor( streamUrl: string, sessionId: string, tokenValue: string ) {
+	constructor( streamUrl: string, sessionId: string, tokenValue: string, logger?: Logger ) {
 		this.streamUrl = streamUrl;
 		this.tokenValue = tokenValue;
 		this.sessionId = sessionId;
+		this.logger = logger || new NullLogger();
 		this.webSocket = new WebSocket(this.streamUrl);
 		this.webSocket.binaryType = 'arraybuffer';
 		this.webSocket.onopen = (ev: WebSocket.OpenEvent) => {
@@ -54,11 +70,13 @@ export default class AWSSSMSession {
 
 			switch( message.MessageType ) {
 				case 'output_stream_data': {
+					this.logger.debug( 'recv', message );
 					this.acknowledgeMessage( message.MessageType, message.MessageId, message.SequenceNumber );
 
 					const decoder = new TextDecoder( 'utf8' );
 					const text = decoder.decode( message.Payload );
 					if ( ! this.outputMap.has( message.MessageId ) ) {
+						this.logger.debug( 'output', message.Payload );
 						this.emit( 'output', text );
 					}
 					this.outputMap.set(message.MessageId, text);
@@ -123,7 +141,8 @@ export default class AWSSSMSession {
 			return;
 		}
 		this.outgoingSequenceNumber++;
-		this.webSocket.send( message )
+		this.logger.debug( 'send', message );
+		this.webSocket.send( message );
 	}
 
 	on( eventName: 'output' | 'connect' | 'disconnect' | 'pause' | 'resume', callback: Function ) {
@@ -141,6 +160,7 @@ export default class AWSSSMSession {
 			Payload: encoder.encode( message ),
 			PayloadType: PayloadType.Output,
 		};
+		this.logger.debug( 'write', data );
 		this.send( encode( data ) );
 	}
 
@@ -151,10 +171,12 @@ export default class AWSSSMSession {
 			Payload: bytes,
 			PayloadType: PayloadType.Output,
 		};
+		this.logger.debug( 'writeRaw', data );
 		this.send( encode( data ) );
 	}
 
 	ping() {
+		this.logger.debug( 'ping' );
 		this.webSocket.send( 'ping' );
 	}
 
@@ -192,6 +214,7 @@ export default class AWSSSMSession {
 		};
 
 		// Write to the socket without incrementing our own sequence number.
+		this.logger.debug( 'ack', message );
 		this.webSocket.send( encode( message ) );
 	}
 }
