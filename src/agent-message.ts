@@ -19,7 +19,7 @@ export type AgentMessage = {
 	MessageId: string;
 	// PayloadDigest: string;
 	PayloadType: PayloadType;
-	Payload: string;
+	Payload: Uint8Array;
 }
 
 // HL - HeaderLength is a 4 byte integer that represents the header length.
@@ -74,6 +74,11 @@ function decodeText( buffer: Uint8Array, start: number, end?: number ) {
 
 	// Strip errant NULs.
 	return decoded.replace( /\0/g, '' );
+}
+
+function decodeBytes( buffer: Uint8Array, start: number, end?: number ) {
+	const decoder = new TextDecoder( 'utf8' );
+	return decoder.decode( buffer.slice( start, end ) );
 }
 
 function putString( buffer: Uint8Array, start: number, end: number, value: string ) {
@@ -158,12 +163,13 @@ function longToHex( buffer: Uint8Array ) {
  */
 export function decode( buffer: Uint8Array ): AgentMessage {
 	const headerLength = decodeInt( buffer, Offset.HL, Offset.HL + Length.HL );
+
 	return {
 		MessageType: decodeText( buffer, Offset.MessageType, Offset.MessageType + Length.MessageType ).trimEnd() as MessageType,
 		SequenceNumber: decodeInt( buffer, Offset.SequenceNumber, Offset.SequenceNumber + Length.SequenceNumber ),
 		MessageId: decodeUuid( buffer, Offset.MessageId, Offset.MessageId + Length.MessageId ),
 		PayloadType: decodeInt( buffer, Offset.PayloadType, Offset.PayloadType + Length.PayloadType ),
-		Payload: decodeText( buffer, headerLength + Length.PayloadLength ),
+		Payload: buffer.slice( headerLength + Length.PayloadLength ),
 	};
 }
 
@@ -197,7 +203,7 @@ export function encode( message: EncodeableAgentMessage ) {
 	// Set the payload.
 	putInt( data, Offset.PayloadType, message.PayloadType );
 	putInt( data, Offset.PayloadLength, payloadLength );
-	putString( data, Offset.Payload, totalLength, message.Payload );
+	data.set( message.Payload, Offset.Payload );
 
 	return data;
 }

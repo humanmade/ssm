@@ -56,7 +56,8 @@ export default class AWSSSMSession {
 				case 'output_stream_data': {
 					this.acknowledgeMessage( message.MessageType, message.MessageId, message.SequenceNumber );
 
-					const text = message.Payload;
+					const decoder = new TextDecoder( 'utf8' );
+					const text = decoder.decode( message.Payload );
 					if ( ! this.outputMap.has( message.MessageId ) ) {
 						this.emit( 'output', text );
 					}
@@ -80,7 +81,8 @@ export default class AWSSSMSession {
 				}
 				case 'acknowledge': {
 					if ( message.Payload ) {
-						const payloadData = JSON.parse( message.Payload );
+						const decoder = new TextDecoder( 'utf8' );
+						const payloadData = JSON.parse( decoder.decode( message.Payload ) );
 						if ( this.lastAcknowledgedSequenceNumber === undefined || this.lastAcknowledgedSequenceNumber < payloadData.AcknowledgedMessageSequenceNumber ) {
 							this.lastAcknowledgedSequenceNumber = payloadData.AcknowledgedMessageSequenceNumber;
 						}
@@ -88,11 +90,13 @@ export default class AWSSSMSession {
 					break;
 				}
 				case 'input_stream_data': {
+					console.log( 'input?' );
 					break;
 				}
 				case 'channel_closed': {
 					if ( message.Payload ) {
-						const payloadData = JSON.parse( message.Payload );
+						const decoder = new TextDecoder( 'utf8' );
+						const payloadData = JSON.parse( decoder.decode( message.Payload ) );
 						if ( payloadData.Output.length > 0 ) {
 							this.emit( 'output', payloadData.Output + '\r\n' );
 						}
@@ -130,10 +134,21 @@ export default class AWSSSMSession {
 	}
 
 	write( message: string ) {
+		const encoder = new TextEncoder();
 		const data = {
 			MessageType: MessageType.InputStreamDataMessage,
 			SequenceNumber: this.outgoingSequenceNumber,
-			Payload: message,
+			Payload: encoder.encode( message ),
+			PayloadType: PayloadType.Output,
+		};
+		this.send( encode( data ) );
+	}
+
+	writeRaw( bytes: Uint8Array ) {
+		const data = {
+			MessageType: MessageType.InputStreamDataMessage,
+			SequenceNumber: this.outgoingSequenceNumber,
+			Payload: bytes,
 			PayloadType: PayloadType.Output,
 		};
 		this.send( encode( data ) );
@@ -148,10 +163,11 @@ export default class AWSSSMSession {
 	}
 
 	setSize( cols: number, rows: number ) {
+		const encoder = new TextEncoder();
 		const message: EncodeableAgentMessage = {
 			MessageType: MessageType.InputStreamDataMessage,
 			SequenceNumber: this.outgoingSequenceNumber,
-			Payload: JSON.stringify( { cols, rows } ),
+			Payload: encoder.encode( JSON.stringify( { cols, rows } ) ),
 			PayloadType: PayloadType.Size,
 		};
 		this.send( encode( message ) );
@@ -162,16 +178,17 @@ export default class AWSSSMSession {
 	}
 
 	private acknowledgeMessage( messageType: MessageType, messageId: string, messageSequenceNumber: number ) {
+		const encoder = new TextEncoder();
 		const message: EncodeableAgentMessage = {
 			MessageType: MessageType.AcknowledgeMessage,
 			SequenceNumber: this.outgoingSequenceNumber,
 			PayloadType: PayloadType.Output,
-			Payload: JSON.stringify( {
+			Payload: encoder.encode( JSON.stringify( {
 				AcknowledgedMessageType: messageType,
 				AcknowledgedMessageId: messageId,
 				AcknowledgedMessageSequenceNumber: messageSequenceNumber,
 				IsSequentialMessage: true
-			} ),
+			} ) ),
 		};
 
 		// Write to the socket without incrementing our own sequence number.
