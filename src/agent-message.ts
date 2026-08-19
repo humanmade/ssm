@@ -19,7 +19,11 @@ export type AgentMessage = {
 	MessageId: string;
 	// PayloadDigest: string;
 	PayloadType: PayloadType;
+	// The payload decoded as UTF-8 text; JSON payloads are parsed from this.
 	Payload: string;
+	// The raw payload bytes. Use these for binary-safe handling, or for
+	// streaming text decoding across message boundaries.
+	PayloadBytes: Uint8Array;
 }
 
 // HL - HeaderLength is a 4 byte integer that represents the header length.
@@ -66,7 +70,11 @@ enum Offset {
 }
 
 /**
- * Decode a UTF-8 byte sequence to a string.
+ * Decode a padded fixed-width header field to a string.
+ *
+ * Header fields may be padded with NULs or spaces depending on the sender,
+ * so strip NULs here (and trim whitespace at the call site). Not for use on
+ * the payload, where every byte is meaningful.
  */
 function decodeText( buffer: Uint8Array, start: number, end?: number ) {
 	const decoder = new TextDecoder( 'utf8' );
@@ -161,16 +169,18 @@ function longToHex( buffer: Uint8Array ) {
  */
 export function decode( buffer: Uint8Array ): AgentMessage {
 	const headerLength = decodeInt( buffer, Offset.HL, Offset.HL + Length.HL );
+	const payloadBytes = buffer.slice( headerLength + Length.PayloadLength );
 	return {
 		MessageType: decodeText( buffer, Offset.MessageType, Offset.MessageType + Length.MessageType ).trimEnd() as MessageType,
 		SequenceNumber: decodeInt( buffer, Offset.SequenceNumber, Offset.SequenceNumber + Length.SequenceNumber ),
 		MessageId: decodeUuid( buffer, Offset.MessageId, Offset.MessageId + Length.MessageId ),
 		PayloadType: decodeInt( buffer, Offset.PayloadType, Offset.PayloadType + Length.PayloadType ),
-		Payload: decodeText( buffer, headerLength + Length.PayloadLength ),
+		Payload: new TextDecoder( 'utf8' ).decode( payloadBytes ),
+		PayloadBytes: payloadBytes,
 	};
 }
 
-export type EncodeableAgentMessage = Omit<AgentMessage, 'MessageId'> & {
+export type EncodeableAgentMessage = Omit<AgentMessage, 'MessageId' | 'PayloadBytes'> & {
 	// Packed control flags (see header notes above). Defaults to 0, which is
 	// what the reference client sends for all data messages; it uses 3 for
 	// acknowledgements.

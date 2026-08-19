@@ -66,6 +66,10 @@ export default class AWSSSMSession {
 	resendTimer?: ReturnType<typeof setInterval>;
 	handlers: Handler[] = [];
 	paused: boolean = false;
+	// Terminal output is decoded with a single streaming decoder so that
+	// multi-byte UTF-8 sequences split across two messages survive the
+	// boundary intact.
+	private outputDecoder = new TextDecoder( 'utf8' );
 
 	constructor( streamUrl: string, sessionId: string, tokenValue: string ) {
 		this.streamUrl = streamUrl;
@@ -266,7 +270,7 @@ export default class AWSSSMSession {
 			case PayloadType.Output:
 			case PayloadType.Error:
 			case PayloadType.StdErr: {
-				this.emit( 'output', message.Payload );
+				this.emit( 'output', this.outputDecoder.decode( message.PayloadBytes, { stream: true } ) );
 				break;
 			}
 			case PayloadType.HandshakeRequest: {
