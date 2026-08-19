@@ -12,9 +12,29 @@ const CLIENT_VERSION = '0.0.2';
 // IncomingMessageBufferCapacity.
 const INCOMING_MESSAGE_BUFFER_CAPACITY = 10000;
 
+// Maximum number of sent-but-unacknowledged messages kept for
+// retransmission. Matches the reference client's
+// OutgoingMessageBufferCapacity.
+const OUTGOING_MESSAGE_BUFFER_CAPACITY = 10000;
+
+// How often to check whether the oldest unacknowledged message needs
+// resending. Matches the reference client's ResendSleepInterval.
+const RESEND_CHECK_INTERVAL = 100;
+
+// How long to wait for an acknowledgement before resending. The reference
+// client starts at 200ms and tunes this from measured round-trip times; we
+// don't measure RTT, so use a conservative fixed value.
+const RETRANSMISSION_TIMEOUT = 1000;
+
 interface Handler {
 	event: 'output' | 'connect' | 'disconnect' | 'pause' | 'resume',
 	callback: Function
+}
+
+interface OutgoingMessage {
+	sequenceNumber: number,
+	data: Uint8Array,
+	lastSentTime: number,
 }
 
 export default class AWSSSMSession {
@@ -40,6 +60,10 @@ export default class AWSSSMSession {
 	// sequenceNumber that has been acknowledged, so we know which of our sent
 	// messages the remote agent has received.
 	lastAcknowledgedSequenceNumber: number | undefined;
+	// Sent messages we haven't received an acknowledgement for yet, oldest
+	// first, kept so they can be retransmitted.
+	outgoingMessageBuffer: OutgoingMessage[] = [];
+	resendTimer?: ReturnType<typeof setInterval>;
 	handlers: Handler[] = [];
 	paused: boolean = false;
 
@@ -111,9 +135,14 @@ export default class AWSSSMSession {
 				case 'acknowledge': {
 					if ( message.Payload ) {
 						const payloadData = JSON.parse( message.Payload );
-						if ( this.lastAcknowledgedSequenceNumber === undefined || this.lastAcknowledgedSequenceNumber < payloadData.AcknowledgedMessageSequenceNumber ) {
-							this.lastAcknowledgedSequenceNumber = payloadData.AcknowledgedMessageSequenceNumber;
+						const acknowledged = payloadData.AcknowledgedMessageSequenceNumber;
+						if ( this.lastAcknowledgedSequenceNumber === undefined || this.lastAcknowledgedSequenceNumber < acknowledged ) {
+							this.lastAcknowledgedSequenceNumber = acknowledged;
 						}
+
+						// The message has been received; no need to keep it around
+						// for retransmission.
+						this.outgoingMessageBuffer = this.outgoingMessageBuffer.filter( m => m.sequenceNumber !== acknowledged );
 					}
 					break;
 				}
@@ -138,9 +167,33 @@ export default class AWSSSMSession {
 
 		this.webSocket.onclose = (ev: any) => {
 			this.connectionClosed = true;
+			if ( this.resendTimer !== undefined ) {
+				clearInterval( this.resendTimer );
+				this.resendTimer = undefined;
+			}
 
 			this.emit( 'disconnect', ev.reason );
 		};
+
+		// Retransmit unacknowledged messages, like the reference client's
+		// ResendStreamDataMessageScheduler.
+		this.resendTimer = setInterval( () => this.resendUnacknowledgedMessage(), RESEND_CHECK_INTERVAL );
+	}
+
+	// Resend the oldest unacknowledged message if its acknowledgement is
+	// overdue. Duplicates are safe: the receiver re-acknowledges and drops
+	// messages below its expected sequence number.
+	private resendUnacknowledgedMessage() {
+		const head = this.outgoingMessageBuffer[ 0 ];
+		if ( ! head || this.webSocket.readyState !== 1 ) {
+			return;
+		}
+		if ( Date.now() - head.lastSentTime < RETRANSMISSION_TIMEOUT ) {
+			return;
+		}
+
+		head.lastSentTime = Date.now();
+		this.webSocket.send( head.data );
 	}
 
 	send( message: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView | Blob ) {
@@ -148,6 +201,20 @@ export default class AWSSSMSession {
 			console.warn( 'WebSocket is not yet ready.' );
 			return;
 		}
+
+		// Keep sequential messages around until they're acknowledged, so they
+		// can be retransmitted if the acknowledgement doesn't arrive.
+		if ( message instanceof Uint8Array ) {
+			this.outgoingMessageBuffer.push( {
+				sequenceNumber: this.outgoingSequenceNumber,
+				data: message,
+				lastSentTime: Date.now(),
+			} );
+			if ( this.outgoingMessageBuffer.length > OUTGOING_MESSAGE_BUFFER_CAPACITY ) {
+				this.outgoingMessageBuffer.shift();
+			}
+		}
+
 		this.outgoingSequenceNumber++;
 		this.webSocket.send( message )
 	}
