@@ -7,6 +7,11 @@ import { ActionStatus, MessageType, PayloadType } from './channel-messages';
 // Sent to the agent in handshake responses. Keep in sync with package.json.
 const CLIENT_VERSION = '0.0.2';
 
+// Maximum number of out-of-order inbound messages held while waiting for the
+// gap before them to be filled. Matches the reference client's
+// IncomingMessageBufferCapacity.
+const INCOMING_MESSAGE_BUFFER_CAPACITY = 10000;
+
 interface Handler {
 	event: 'output' | 'connect' | 'disconnect' | 'pause' | 'resume',
 	callback: Function
@@ -22,7 +27,12 @@ export default class AWSSSMSession {
 	// an incrementing integer). Also, messages can be ordered back into sequence if
 	// anything were to get ahead of line.
 	outgoingSequenceNumber = 0;
-	outputMap = new Map();
+	// The sequence number we expect from the next inbound stream message.
+	// Messages arriving ahead of it are held in incomingMessageBuffer until
+	// the gap before them is filled; messages behind it are duplicates and
+	// are re-acknowledged but not re-processed.
+	expectedSequenceNumber = 0;
+	incomingMessageBuffer: Map<number, AgentMessage> = new Map();
 	connectionClosed = false;
 	connectionTerminated = false;
 	// Each message that is sent with a sequenceNumber is replied to with an
@@ -56,12 +66,30 @@ export default class AWSSSMSession {
 
 			switch( message.MessageType ) {
 				case 'output_stream_data': {
-					this.acknowledgeMessage( message.MessageType, message.MessageId, message.SequenceNumber );
-
-					if ( ! this.outputMap.has( message.MessageId ) ) {
+					if ( message.SequenceNumber === this.expectedSequenceNumber ) {
+						this.acknowledgeMessage( message.MessageType, message.MessageId, message.SequenceNumber );
 						this.handleOutputMessage( message );
+						this.expectedSequenceNumber++;
+
+						// Process any buffered messages which are now in sequence.
+						let next;
+						while ( ( next = this.incomingMessageBuffer.get( this.expectedSequenceNumber ) ) !== undefined ) {
+							this.incomingMessageBuffer.delete( this.expectedSequenceNumber );
+							this.handleOutputMessage( next );
+							this.expectedSequenceNumber++;
+						}
+					} else if ( message.SequenceNumber > this.expectedSequenceNumber ) {
+						// Out-of-order message: acknowledge it and hold it until the
+						// gap before it is filled.
+						if ( this.incomingMessageBuffer.size < INCOMING_MESSAGE_BUFFER_CAPACITY ) {
+							this.acknowledgeMessage( message.MessageType, message.MessageId, message.SequenceNumber );
+							this.incomingMessageBuffer.set( message.SequenceNumber, message );
+						}
+					} else {
+						// Already processed (e.g. a resend after our acknowledgement
+						// was lost): re-acknowledge, but don't re-emit.
+						this.acknowledgeMessage( message.MessageType, message.MessageId, message.SequenceNumber );
 					}
-					this.outputMap.set( message.MessageId, true );
 					break
 				}
 				case 'start_publication': {
