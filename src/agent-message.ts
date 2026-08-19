@@ -92,9 +92,11 @@ function putString( buffer: Uint8Array, start: number, end: number, value: strin
  * Decode a byte sequence to an integer.
  */
 function decodeInt( buffer: Uint8Array, start: number, end: number ) {
+	// Multiply rather than shift; shifts operate on 32-bit integers, which
+	// would wrap when decoding 8-byte fields. Exact for values below 2^53.
 	const bytes = buffer.slice( start, end );
 	return bytes.reduce( ( acc, byte ) => {
-		return ( acc << 8 ) + byte;
+		return ( acc * 0x100 ) + byte;
 	}, 0 )
 }
 
@@ -115,11 +117,12 @@ function putInt( buffer: Uint8Array, pos: number, value: number ) {
 /**
  * Encode a (64-bit) long into a byte sequence.
  *
- * We cheat here; JS doesn't support 64-bit integers (aka longs), so we can
- * just use putInt with a 4 byte offset.
+ * JS numbers are doubles, so this is exact for values up to 2^53 - 1; that
+ * comfortably covers epoch milliseconds and sequence numbers.
  */
 function putLong( buffer: Uint8Array, pos: number, value: number ) {
-	putInt( buffer, pos + 4, value );
+	putInt( buffer, pos, Math.floor( value / 0x100000000 ) );
+	putInt( buffer, pos + 4, value >>> 0 );
 }
 
 /**
