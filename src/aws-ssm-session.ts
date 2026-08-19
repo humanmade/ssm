@@ -1,8 +1,11 @@
 import { v4 as uuidv4 } from 'uuid';
 import WebSocket from 'isomorphic-ws';
 
-import { decode, encode, EncodeableAgentMessage } from './agent-message';
-import { MessageType, PayloadType } from './channel-messages';
+import { AgentMessage, decode, encode, EncodeableAgentMessage } from './agent-message';
+import { ActionStatus, MessageType, PayloadType } from './channel-messages';
+
+// Sent to the agent in handshake responses. Keep in sync with package.json.
+const CLIENT_VERSION = '0.0.2';
 
 interface Handler {
 	event: 'output' | 'connect' | 'disconnect' | 'pause' | 'resume',
@@ -55,11 +58,10 @@ export default class AWSSSMSession {
 				case 'output_stream_data': {
 					this.acknowledgeMessage( message.MessageType, message.MessageId, message.SequenceNumber );
 
-					const text = message.Payload;
 					if ( ! this.outputMap.has( message.MessageId ) ) {
-						this.emit( 'output', text );
+						this.handleOutputMessage( message );
 					}
-					this.outputMap.set(message.MessageId, text);
+					this.outputMap.set( message.MessageId, true );
 					break
 				}
 				case 'start_publication': {
@@ -159,6 +161,72 @@ export default class AWSSSMSession {
 
 	close() {
 		this.webSocket.close();
+	}
+
+	// Process an output_stream_data message according to its payload type.
+	// Only data payloads are terminal output; handshake payloads are part of
+	// session setup and must not be shown to the user.
+	private handleOutputMessage( message: AgentMessage ) {
+		switch ( message.PayloadType ) {
+			case PayloadType.Output:
+			case PayloadType.Error:
+			case PayloadType.StdErr: {
+				this.emit( 'output', message.Payload );
+				break;
+			}
+			case PayloadType.HandshakeRequest: {
+				this.handleHandshakeRequest( message );
+				break;
+			}
+			case PayloadType.HandshakeComplete: {
+				const payloadData = JSON.parse( message.Payload );
+				if ( payloadData.CustomerMessage ) {
+					this.emit( 'output', payloadData.CustomerMessage + '\r\n' );
+				}
+				break;
+			}
+			default: {
+				console.error( `Unhandled payload type ${ message.PayloadType }.` );
+			}
+		}
+	}
+
+	// Respond to a handshake request from the agent.
+	//
+	// We can satisfy the SessionType action; anything else (notably
+	// KMSEncryption) is unsupported, which the agent treats as a failed
+	// handshake, and it will cancel the session.
+	private handleHandshakeRequest( message: AgentMessage ) {
+		const request = JSON.parse( message.Payload );
+		const errors: string[] = [];
+		const actions = ( request.RequestedClientActions || [] ).map( ( action: { ActionType: string } ) => {
+			if ( action.ActionType === 'SessionType' ) {
+				return {
+					ActionType: action.ActionType,
+					ActionStatus: ActionStatus.Success,
+				};
+			}
+
+			const error = `Unsupported action ${ action.ActionType }`;
+			errors.push( error );
+			return {
+				ActionType: action.ActionType,
+				ActionStatus: ActionStatus.Unsupported,
+				Error: error,
+			};
+		} );
+
+		const response = {
+			ClientVersion: CLIENT_VERSION,
+			ProcessedClientActions: actions,
+			Errors: errors,
+		};
+		this.send( encode( {
+			MessageType: MessageType.InputStreamDataMessage,
+			SequenceNumber: this.outgoingSequenceNumber,
+			Payload: JSON.stringify( response ),
+			PayloadType: PayloadType.HandshakeResponse,
+		} ) );
 	}
 
 	private acknowledgeMessage( messageType: MessageType, messageId: string, messageSequenceNumber: number ) {

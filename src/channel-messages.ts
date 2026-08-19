@@ -34,4 +34,14 @@ export enum PayloadType {
 	EncChallengeRequest  = 8,
 	EncChallengeResponse = 9,
 	Flag                 = 10,
+	StdErr               = 11,
+	ExitCode             = 12,
+}
+
+// ActionStatus is the result of processing a client action requested by the
+// agent during the handshake.
+export enum ActionStatus {
+	Success     = 1,
+	Failed      = 2,
+	Unsupported = 3,
 }
