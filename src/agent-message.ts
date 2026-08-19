@@ -170,7 +170,12 @@ export function decode( buffer: Uint8Array ): AgentMessage {
 	};
 }
 
-export type EncodeableAgentMessage = Omit<AgentMessage, 'MessageId'>;
+export type EncodeableAgentMessage = Omit<AgentMessage, 'MessageId'> & {
+	// Packed control flags (see header notes above). Defaults to 0, which is
+	// what the reference client sends for all data messages; it uses 3 for
+	// acknowledgements.
+	Flags?: number;
+};
 
 /**
  * Encode a message.
@@ -192,7 +197,7 @@ export function encode( message: EncodeableAgentMessage ) {
 	putInt( data, Offset.SchemaVersion, 1 );
 	putLong( data, Offset.CreatedDate, Date.now() );
 	putLong( data, Offset.SequenceNumber, message.SequenceNumber );
-	putLong( data, Offset.Flags, message.SequenceNumber > 0 ? 0b00 : 0b01 );
+	putLong( data, Offset.Flags, message.Flags ?? 0 );
 
 	// Generate a UUID. The wire format stores the least-significant 8 bytes
 	// first, then the most-significant 8 (see decodeUuid), so flip the halves.

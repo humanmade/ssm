@@ -327,7 +327,10 @@ export default class AWSSSMSession {
 	private acknowledgeMessage( messageType: MessageType, messageId: string, messageSequenceNumber: number ) {
 		const message: EncodeableAgentMessage = {
 			MessageType: MessageType.AcknowledgeMessage,
-			SequenceNumber: this.outgoingSequenceNumber,
+			// Acknowledgements aren't part of the sequential stream; the
+			// reference client sends them with sequence number 0 and flags 3.
+			SequenceNumber: 0,
+			Flags: 3,
 			PayloadType: PayloadType.Output,
 			Payload: JSON.stringify( {
 				AcknowledgedMessageType: messageType,
