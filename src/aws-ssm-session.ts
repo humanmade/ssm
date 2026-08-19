@@ -241,7 +241,16 @@ export default class AWSSSMSession {
 	}
 
 	ping() {
-		this.webSocket.send( 'ping' );
+		// The reference client's keepalive is a WebSocket ping control frame
+		// with payload "keepalive", sent every 5 minutes. Node's `ws` exposes
+		// ping(); browsers can't send control frames, so fall back to a bare
+		// text frame, which the service tolerates.
+		const webSocket = this.webSocket as WebSocket & { ping?: ( data: string ) => void };
+		if ( typeof webSocket.ping === 'function' ) {
+			webSocket.ping( 'keepalive' );
+		} else {
+			this.webSocket.send( 'ping' );
+		}
 	}
 
 	emit( eventName: 'output' | 'connect' | 'disconnect' | 'pause' | 'resume', data: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView | Blob ) {
