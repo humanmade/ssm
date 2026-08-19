@@ -173,8 +173,11 @@ export type EncodeableAgentMessage = Omit<AgentMessage, 'MessageId'>;
  * Encode a message.
  */
 export function encode( message: EncodeableAgentMessage ) {
-	const payloadLength = message.Payload.length;
-	const totalLength = Offset.PayloadLength + payloadLength + 4;
+	// Encode the payload to UTF-8 first; the length, digest, and bytes on the
+	// wire must all be computed from the same byte sequence.
+	const payload = new TextEncoder().encode( message.Payload );
+	const payloadLength = payload.length;
+	const totalLength = Offset.Payload + payloadLength;
 
 	// | HL|         MessageType           |Ver|  CD   |  Seq  | Flags |
 	// |         MessageId                     |           Digest              |PayType| PayLen|
@@ -192,12 +195,12 @@ export function encode( message: EncodeableAgentMessage ) {
 	uuidv4( {}, data, Offset.MessageId );
 
 	// Generate the digest.
-	data.set( sha256.update( message.Payload ).digest(), Offset.PayloadDigest );
+	data.set( sha256.update( payload ).digest(), Offset.PayloadDigest );
 
 	// Set the payload.
 	putInt( data, Offset.PayloadType, message.PayloadType );
 	putInt( data, Offset.PayloadLength, payloadLength );
-	putString( data, Offset.Payload, totalLength, message.Payload );
+	data.set( payload, Offset.Payload );
 
 	return data;
 }
