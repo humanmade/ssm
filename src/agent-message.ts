@@ -194,8 +194,12 @@ export function encode( message: EncodeableAgentMessage ) {
 	putLong( data, Offset.SequenceNumber, message.SequenceNumber );
 	putLong( data, Offset.Flags, message.SequenceNumber > 0 ? 0b00 : 0b01 );
 
-	// Generate a UUID.
-	uuidv4( {}, data, Offset.MessageId );
+	// Generate a UUID. The wire format stores the least-significant 8 bytes
+	// first, then the most-significant 8 (see decodeUuid), so flip the halves.
+	const messageId = new Uint8Array( 16 );
+	uuidv4( {}, messageId, 0 );
+	data.set( messageId.subarray( 8, 16 ), Offset.MessageId );
+	data.set( messageId.subarray( 0, 8 ), Offset.MessageId + 8 );
 
 	// Generate the digest.
 	data.set( sha256.update( payload ).digest(), Offset.PayloadDigest );
