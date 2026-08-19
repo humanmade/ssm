@@ -156,7 +156,7 @@ export default class AWSSSMSession {
 				case 'channel_closed': {
 					if ( message.Payload ) {
 						const payloadData = JSON.parse( message.Payload );
-						if ( payloadData.Output.length > 0 ) {
+						if ( payloadData.Output ) {
 							this.emit( 'output', payloadData.Output + '\r\n' );
 						}
 					}
