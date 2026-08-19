@@ -24,9 +24,8 @@ export default class AWSSSMSession {
 	connectionTerminated = false;
 	// Each message that is sent with a sequenceNumber is replied to with an
 	// acknowledgement from the SSM remote agent. We keep track of the latest
-	// sequenceNumber that has been acknowledged, so we know what number to reset
-	// to if we fall out of sync with the remove server. Currently no buffering or
-	// replaying of messages exists, but it could be added in the future.
+	// sequenceNumber that has been acknowledged, so we know which of our sent
+	// messages the remote agent has received.
 	lastAcknowledgedSequenceNumber: number | undefined;
 	handlers: Handler[] = [];
 	paused: boolean = false;
@@ -64,11 +63,12 @@ export default class AWSSSMSession {
 					break
 				}
 				case 'start_publication': {
-					if ( this.lastAcknowledgedSequenceNumber !== undefined ) {
-						this.outgoingSequenceNumber = this.lastAcknowledgedSequenceNumber;
-					} else {
-						this.outgoingSequenceNumber = 0;
-					}
+					// Note: the sequence number deliberately continues from where it
+					// left off. It must never rewind: an acknowledgement for sequence
+					// number N means the remote agent has received N, so re-using an
+					// acknowledged number would be discarded as a duplicate. The
+					// reference client keeps its counter monotonic even across full
+					// websocket reconnects.
 					this.paused = false;
 					this.emit( 'resume', '' );
 					break;
