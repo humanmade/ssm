@@ -5,7 +5,7 @@ import { AgentMessage, decode, encode, EncodeableAgentMessage } from './agent-me
 import { ActionStatus, MessageType, PayloadType } from './channel-messages';
 
 // Sent to the agent in handshake responses. Keep in sync with package.json.
-const CLIENT_VERSION = '0.0.2';
+const CLIENT_VERSION = '0.0.3';
 
 // Maximum number of out-of-order inbound messages held while waiting for the
 // gap before them to be filled. Matches the reference client's
