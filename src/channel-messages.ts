@@ -45,3 +45,10 @@ export enum ActionStatus {
 	Failed      = 2,
 	Unsupported = 3,
 }
+
+// Four-byte, big-endian values carried in payload type Flag.
+export enum PayloadTypeFlag {
+	DisconnectToPort = 1,
+	TerminateSession = 2,
+	ConnectToPortError = 3,
+}

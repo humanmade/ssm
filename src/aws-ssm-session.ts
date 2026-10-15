@@ -2,7 +2,13 @@ import { v4 as uuidv4 } from 'uuid';
 import WebSocket from 'isomorphic-ws';
 
 import { AgentMessage, decode, encode, EncodeableAgentMessage } from './agent-message';
-import { ActionStatus, MessageType, PayloadType } from './channel-messages';
+import { ActionStatus, MessageType, PayloadType, PayloadTypeFlag } from './channel-messages';
+
+import { HandshakeRequestPayload, HandshakeResponsePayload } from './handshake';
+
+export { decode } from './agent-message';
+export { PayloadTypeFlag } from './channel-messages';
+export { HandshakeRequestPayload, HandshakeResponsePayload } from './handshake';
 
 // Sent to the agent in handshake responses. Keep in sync with package.json.
 const CLIENT_VERSION = '0.0.3';
@@ -27,7 +33,7 @@ const RESEND_CHECK_INTERVAL = 100;
 const RETRANSMISSION_TIMEOUT = 1000;
 
 interface Handler {
-	event: 'output' | 'connect' | 'disconnect' | 'pause' | 'resume',
+	event: 'output' | 'rawOutput' | 'connect' | 'disconnect' | 'pause' | 'resume' | 'handshake' | 'handshakeComplete' | 'flag',
 	callback: Function
 }
 
@@ -35,6 +41,8 @@ interface OutgoingMessage {
 	sequenceNumber: number,
 	data: Uint8Array,
 	lastSentTime: number,
+	resendAttempts: number,
+	sent: boolean,
 }
 
 export default class AWSSSMSession {
@@ -64,6 +72,8 @@ export default class AWSSSMSession {
 	// first, kept so they can be retransmitted.
 	outgoingMessageBuffer: OutgoingMessage[] = [];
 	resendTimer?: ReturnType<typeof setInterval>;
+	keepaliveTimer?: ReturnType<typeof setInterval>;
+	private didDisconnect = false;
 	handlers: Handler[] = [];
 	paused: boolean = false;
 	// Terminal output is decoded with a single streaming decoder so that
@@ -89,99 +99,107 @@ export default class AWSSSMSession {
 		};
 
 		this.webSocket.onmessage = (ev: any) => {
-			const uint8 = new Uint8Array( ev.data );
-			const message = decode( uint8 );
+			if ( this.connectionClosed ) return;
+			try {
+				const uint8 = new Uint8Array( ev.data );
+				const message = decode( uint8 );
 
-			switch( message.MessageType ) {
-				case 'output_stream_data': {
-					if ( message.SequenceNumber === this.expectedSequenceNumber ) {
-						this.acknowledgeMessage( message.MessageType, message.MessageId, message.SequenceNumber );
-						this.handleOutputMessage( message );
-						this.expectedSequenceNumber++;
-
-						// Process any buffered messages which are now in sequence.
-						let next;
-						while ( ( next = this.incomingMessageBuffer.get( this.expectedSequenceNumber ) ) !== undefined ) {
-							this.incomingMessageBuffer.delete( this.expectedSequenceNumber );
-							this.handleOutputMessage( next );
-							this.expectedSequenceNumber++;
-						}
-					} else if ( message.SequenceNumber > this.expectedSequenceNumber ) {
-						// Out-of-order message: acknowledge it and hold it until the
-						// gap before it is filled.
-						if ( this.incomingMessageBuffer.size < INCOMING_MESSAGE_BUFFER_CAPACITY ) {
+				switch( message.MessageType ) {
+					case 'output_stream_data': {
+						if ( message.SequenceNumber === this.expectedSequenceNumber ) {
 							this.acknowledgeMessage( message.MessageType, message.MessageId, message.SequenceNumber );
-							this.incomingMessageBuffer.set( message.SequenceNumber, message );
-						}
-					} else {
-						// Already processed (e.g. a resend after our acknowledgement
-						// was lost): re-acknowledge, but don't re-emit.
-						this.acknowledgeMessage( message.MessageType, message.MessageId, message.SequenceNumber );
-					}
-					break
-				}
-				case 'start_publication': {
-					// Note: the sequence number deliberately continues from where it
-					// left off. It must never rewind: an acknowledgement for sequence
-					// number N means the remote agent has received N, so re-using an
-					// acknowledged number would be discarded as a duplicate. The
-					// reference client keeps its counter monotonic even across full
-					// websocket reconnects.
-					this.paused = false;
-					this.emit( 'resume', '' );
-					break;
-				}
-				case 'pause_publication': {
-					this.paused = true;
-					this.emit( 'pause', '' );
-					break;
-				}
-				case 'acknowledge': {
-					if ( message.Payload ) {
-						const payloadData = JSON.parse( message.Payload );
-						const acknowledged = payloadData.AcknowledgedMessageSequenceNumber;
-						if ( this.lastAcknowledgedSequenceNumber === undefined || this.lastAcknowledgedSequenceNumber < acknowledged ) {
-							this.lastAcknowledgedSequenceNumber = acknowledged;
-						}
+							this.handleOutputMessage( message );
+							this.expectedSequenceNumber++;
 
-						// The message has been received; no need to keep it around
-						// for retransmission.
-						this.outgoingMessageBuffer = this.outgoingMessageBuffer.filter( m => m.sequenceNumber !== acknowledged );
-					}
-					break;
-				}
-				case 'input_stream_data': {
-					break;
-				}
-				case 'channel_closed': {
-					if ( message.Payload ) {
-						const payloadData = JSON.parse( message.Payload );
-						if ( payloadData.Output ) {
-							this.emit( 'output', payloadData.Output + '\r\n' );
+							// Process any buffered messages which are now in sequence.
+							let next;
+							while ( ( next = this.incomingMessageBuffer.get( this.expectedSequenceNumber ) ) !== undefined ) {
+								this.incomingMessageBuffer.delete( this.expectedSequenceNumber );
+								this.handleOutputMessage( next );
+								this.expectedSequenceNumber++;
+							}
+						} else if ( message.SequenceNumber > this.expectedSequenceNumber ) {
+							// Out-of-order message: acknowledge it and hold it until the
+							// gap before it is filled.
+							if ( this.incomingMessageBuffer.size < INCOMING_MESSAGE_BUFFER_CAPACITY ) {
+								this.acknowledgeMessage( message.MessageType, message.MessageId, message.SequenceNumber );
+								this.incomingMessageBuffer.set( message.SequenceNumber, message );
+							}
+						} else {
+							// Already processed (e.g. a resend after our acknowledgement
+							// was lost): re-acknowledge, but don't re-emit.
+							this.acknowledgeMessage( message.MessageType, message.MessageId, message.SequenceNumber );
 						}
+						break
 					}
-					this.connectionTerminated = true;
-					break;
+					case 'start_publication': {
+						// Note: the sequence number deliberately continues from where it
+						// left off. It must never rewind: an acknowledgement for sequence
+						// number N means the remote agent has received N, so re-using an
+						// acknowledged number would be discarded as a duplicate. The
+						// reference client keeps its counter monotonic even across full
+						// websocket reconnects.
+						this.paused = false;
+						this.flushPendingMessages();
+						this.emit( 'resume', '' );
+						break;
+					}
+					case 'pause_publication': {
+						this.paused = true;
+						this.emit( 'pause', '' );
+						break;
+					}
+					case 'acknowledge': {
+						if ( message.Payload ) {
+							const payloadData = JSON.parse( message.Payload );
+							const acknowledged = payloadData.AcknowledgedMessageSequenceNumber;
+							if ( this.lastAcknowledgedSequenceNumber === undefined || this.lastAcknowledgedSequenceNumber < acknowledged ) {
+								this.lastAcknowledgedSequenceNumber = acknowledged;
+							}
+
+							// The message has been received; no need to keep it around
+							// for retransmission.
+							this.outgoingMessageBuffer = this.outgoingMessageBuffer.filter( m => m.sequenceNumber !== acknowledged );
+						}
+						break;
+					}
+					case 'input_stream_data': {
+						break;
+					}
+					case 'channel_closed': {
+						if ( message.Payload ) {
+							const payloadData = JSON.parse( message.Payload );
+							if ( payloadData.Output ) {
+								this.emit( 'output', payloadData.Output + '\r\n' );
+							}
+						}
+						this.connectionTerminated = true;
+						this.close();
+						break;
+					}
+					default: {
+						console.error( `Unhandled message type ${ message.MessageType }.` );
+					}
 				}
-				default: {
-					console.error( `Unhandled message type ${ message.MessageType }.` );
-				}
+			} catch {
+				this.fail( 'Invalid SSM message or session handler failure.' );
 			}
 		};
 
-		this.webSocket.onclose = (ev: any) => {
-			this.connectionClosed = true;
-			if ( this.resendTimer !== undefined ) {
-				clearInterval( this.resendTimer );
-				this.resendTimer = undefined;
-			}
-
-			this.emit( 'disconnect', ev.reason );
-		};
+		this.webSocket.onclose = (ev: any) => this.disconnected( ev.reason || '' );
+		this.webSocket.onerror = () => this.fail( 'SSM WebSocket connection failed.' );
 
 		// Retransmit unacknowledged messages, like the reference client's
 		// ResendStreamDataMessageScheduler.
-		this.resendTimer = setInterval( () => this.resendUnacknowledgedMessage(), RESEND_CHECK_INTERVAL );
+		this.resendTimer = setInterval( () => {
+			try { this.resendUnacknowledgedMessage(); }
+			catch { this.fail( 'Could not resend SSM data.' ); }
+		}, RESEND_CHECK_INTERVAL );
+		this.keepaliveTimer = setInterval( () => {
+			if ( this.webSocket.readyState !== 1 ) return;
+			try { this.ping(); }
+			catch { this.fail( 'SSM keepalive failed.' ); }
+		}, 5 * 60 * 1000 );
 	}
 
 	// Resend the oldest unacknowledged message if its acknowledgement is
@@ -189,55 +207,61 @@ export default class AWSSSMSession {
 	// messages below its expected sequence number.
 	private resendUnacknowledgedMessage() {
 		const head = this.outgoingMessageBuffer[ 0 ];
-		if ( ! head || this.webSocket.readyState !== 1 ) {
+		if ( ! head || this.paused || this.webSocket.readyState !== 1 ) {
 			return;
 		}
 		if ( Date.now() - head.lastSentTime < RETRANSMISSION_TIMEOUT ) {
 			return;
 		}
 
+		if ( head.resendAttempts >= 300 ) {
+			this.fail( 'SSM acknowledgement timed out.' );
+			return;
+		}
+		head.resendAttempts++;
 		head.lastSentTime = Date.now();
+		head.sent = true;
 		this.webSocket.send( head.data );
 	}
 
 	send( message: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView | Blob ) {
 		if ( this.webSocket.readyState !== 1 ) {
-			console.warn( 'WebSocket is not yet ready.' );
-			return;
+			throw new Error( 'SSM WebSocket is not open' );
+		}
+
+		if ( this.paused && ! ( message instanceof Uint8Array ) ) {
+			throw new Error( 'Cannot queue an unencoded SSM message while publication is paused' );
 		}
 
 		// Keep sequential messages around until they're acknowledged, so they
 		// can be retransmitted if the acknowledgement doesn't arrive.
 		if ( message instanceof Uint8Array ) {
+			if ( this.outgoingMessageBuffer.length >= OUTGOING_MESSAGE_BUFFER_CAPACITY ) {
+				throw new Error( 'SSM outgoing buffer is full; refusing to drop unacknowledged data' );
+			}
 			this.outgoingMessageBuffer.push( {
 				sequenceNumber: this.outgoingSequenceNumber,
 				data: message,
-				lastSentTime: Date.now(),
+				lastSentTime: this.paused ? 0 : Date.now(),
+				sent: ! this.paused,
+				resendAttempts: 0,
 			} );
-			if ( this.outgoingMessageBuffer.length > OUTGOING_MESSAGE_BUFFER_CAPACITY ) {
-				this.outgoingMessageBuffer.shift();
-			}
 		}
 
 		this.outgoingSequenceNumber++;
-		this.webSocket.send( message )
+		if ( ! this.paused ) this.webSocket.send( message );
 	}
 
-	on( eventName: 'output' | 'connect' | 'disconnect' | 'pause' | 'resume', callback: Function ) {
+	on( eventName: Handler['event'], callback: Function ) {
 		this.handlers.push( {
 			event: eventName,
 			callback,
 		} );
+		return this;
 	}
 
 	write( message: string ) {
-		const data = {
-			MessageType: MessageType.InputStreamDataMessage,
-			SequenceNumber: this.outgoingSequenceNumber,
-			Payload: message,
-			PayloadType: PayloadType.Output,
-		};
-		this.send( encode( data ) );
+		this.writeRaw( new TextEncoder().encode( message ) );
 	}
 
 	ping() {
@@ -253,7 +277,7 @@ export default class AWSSSMSession {
 		}
 	}
 
-	emit( eventName: 'output' | 'connect' | 'disconnect' | 'pause' | 'resume', data: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView | Blob ) {
+	emit( eventName: Handler['event'], data: unknown ) {
 		this.handlers.filter( h => h.event === eventName ).map( h => h.callback( data ) );
 	}
 
@@ -268,7 +292,79 @@ export default class AWSSSMSession {
 	}
 
 	close() {
-		this.webSocket.close();
+		this.clearTimers();
+		if ( this.webSocket.readyState === 0 || this.webSocket.readyState === 1 ) this.webSocket.close();
+	}
+
+	private clearTimers() {
+		if ( this.resendTimer !== undefined ) clearInterval( this.resendTimer );
+		if ( this.keepaliveTimer !== undefined ) clearInterval( this.keepaliveTimer );
+		this.resendTimer = undefined;
+		this.keepaliveTimer = undefined;
+	}
+
+	private disconnected( reason: string ) {
+		this.connectionClosed = true;
+		this.clearTimers();
+		this.incomingMessageBuffer.clear();
+		this.outgoingMessageBuffer = [];
+		if ( ! this.didDisconnect ) {
+			this.didDisconnect = true;
+			this.emit( 'disconnect', reason );
+		}
+	}
+
+	private fail( reason: string ) {
+		this.disconnected( reason );
+		this.close();
+	}
+
+	private flushPendingMessages() {
+		for ( const message of this.outgoingMessageBuffer ) {
+			if ( this.paused || this.webSocket.readyState !== 1 ) return;
+			if ( ! message.sent ) {
+				message.sent = true;
+				message.lastSentTime = Date.now();
+				this.webSocket.send( message.data );
+			}
+		}
+	}
+
+	/** Write raw bytes without UTF-8 conversion or newline rewriting. */
+	writeRaw( bytes: Uint8Array ) {
+		const count = Math.ceil( bytes.byteLength / 1024 );
+		if ( this.outgoingMessageBuffer.length + count > OUTGOING_MESSAGE_BUFFER_CAPACITY ) {
+			throw new Error( 'SSM outgoing buffer is full; refusing to partially write binary data' );
+		}
+		for ( let start = 0; start < bytes.byteLength; start += 1024 ) {
+			this.send( encode( {
+				MessageType: MessageType.InputStreamDataMessage,
+				SequenceNumber: this.outgoingSequenceNumber,
+				Payload: bytes.subarray( start, start + 1024 ),
+				PayloadType: PayloadType.Output,
+			} ) );
+		}
+	}
+
+	sendHandshakeResponse( response: HandshakeResponsePayload ) {
+		this.send( encode( {
+			MessageType: MessageType.InputStreamDataMessage,
+			SequenceNumber: this.outgoingSequenceNumber,
+			Payload: JSON.stringify( response ),
+			PayloadType: PayloadType.HandshakeResponse,
+		} ) );
+	}
+
+	/** Basic-port reconnect and termination controls, not database bytes. */
+	sendFlag( flag: PayloadTypeFlag ) {
+		const bytes = new Uint8Array( 4 );
+		new DataView( bytes.buffer ).setUint32( 0, flag, false );
+		this.send( encode( {
+			MessageType: MessageType.InputStreamDataMessage,
+			SequenceNumber: this.outgoingSequenceNumber,
+			Payload: bytes,
+			PayloadType: PayloadType.Flag,
+		} ) );
 	}
 
 	// Process an output_stream_data message according to its payload type.
@@ -276,7 +372,11 @@ export default class AWSSSMSession {
 	// session setup and must not be shown to the user.
 	private handleOutputMessage( message: AgentMessage ) {
 		switch ( message.PayloadType ) {
-			case PayloadType.Output:
+			case PayloadType.Output: {
+				this.emit( 'rawOutput', message.PayloadBytes );
+				this.emit( 'output', this.outputDecoder.decode( message.PayloadBytes, { stream: true } ) );
+				break;
+			}
 			case PayloadType.Error:
 			case PayloadType.StdErr: {
 				this.emit( 'output', this.outputDecoder.decode( message.PayloadBytes, { stream: true } ) );
@@ -288,9 +388,15 @@ export default class AWSSSMSession {
 			}
 			case PayloadType.HandshakeComplete: {
 				const payloadData = JSON.parse( message.Payload );
-				if ( payloadData.CustomerMessage ) {
+				this.emit( 'handshakeComplete', payloadData );
+				if ( payloadData.CustomerMessage && ! this.handlers.some( h => h.event === 'handshakeComplete' ) ) {
 					this.emit( 'output', payloadData.CustomerMessage + '\r\n' );
 				}
+				break;
+			}
+			case PayloadType.Flag: {
+				if ( message.PayloadBytes.length !== 4 ) throw new Error( 'Invalid SSM flag' );
+				this.emit( 'flag', new DataView( message.PayloadBytes.buffer, message.PayloadBytes.byteOffset, 4 ).getUint32( 0, false ) );
 				break;
 			}
 			default: {
@@ -305,10 +411,15 @@ export default class AWSSSMSession {
 	// KMSEncryption) is unsupported, which the agent treats as a failed
 	// handshake, and it will cancel the session.
 	private handleHandshakeRequest( message: AgentMessage ) {
-		const request = JSON.parse( message.Payload );
+		const request = JSON.parse( message.Payload ) as HandshakeRequestPayload;
+		if ( ! request || ! Array.isArray( request.RequestedClientActions ) ) throw new Error( 'Invalid SSM handshake' );
+		if ( this.handlers.some( h => h.event === 'handshake' ) ) {
+			this.emit( 'handshake', request );
+			return;
+		}
 		const errors: string[] = [];
-		const actions = ( request.RequestedClientActions || [] ).map( ( action: { ActionType: string } ) => {
-			if ( action.ActionType === 'SessionType' ) {
+		const actions = ( request.RequestedClientActions || [] ).map( action => {
+			if ( action.ActionType === 'SessionType' && [ 'Standard_Stream', 'InteractiveCommands', 'NonInteractiveCommands' ].includes( action.ActionParameters?.SessionType || '' ) ) {
 				return {
 					ActionType: action.ActionType,
 					ActionStatus: ActionStatus.Success,
@@ -329,12 +440,7 @@ export default class AWSSSMSession {
 			ProcessedClientActions: actions,
 			Errors: errors,
 		};
-		this.send( encode( {
-			MessageType: MessageType.InputStreamDataMessage,
-			SequenceNumber: this.outgoingSequenceNumber,
-			Payload: JSON.stringify( response ),
-			PayloadType: PayloadType.HandshakeResponse,
-		} ) );
+		this.sendHandshakeResponse( response );
 	}
 
 	private acknowledgeMessage( messageType: MessageType, messageId: string, messageSequenceNumber: number ) {

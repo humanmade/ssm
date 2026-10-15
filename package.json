@@ -15,7 +15,8 @@
   "scripts": {
     "build": "tsc",
     "prepublish": "tsc",
-    "start": "tsc --watch"
+    "start": "tsc --watch",
+    "test": "npm run build && node --test test/*.test.cjs"
   },
   "files": [
     "build/"

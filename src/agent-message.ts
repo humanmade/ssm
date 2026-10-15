@@ -168,10 +168,34 @@ function longToHex( buffer: Uint8Array ) {
  * Decode a message.
  */
 export function decode( buffer: Uint8Array ): AgentMessage {
+	if ( buffer.length < Offset.Payload ) {
+		throw new Error( 'Truncated SSM message header' );
+	}
+	const messageType = decodeText( buffer, Offset.MessageType, Offset.MessageType + Length.MessageType ).trimEnd() as MessageType;
+	// MGS publication controls may have zeroed header metadata. AWS skips
+	// payload validation for these messages; they carry no application data.
+	if ( messageType === MessageType.StartPublicationMessage || messageType === MessageType.PausePublicationMessage ) {
+		return { MessageType: messageType, SequenceNumber: 0, MessageId: decodeUuid( buffer, Offset.MessageId, Offset.MessageId + Length.MessageId ),
+			PayloadType: 0, Payload: '', PayloadBytes: new Uint8Array() };
+	}
 	const headerLength = decodeInt( buffer, Offset.HL, Offset.HL + Length.HL );
+	if ( headerLength < Offset.PayloadLength || headerLength + Length.PayloadLength > buffer.length ) {
+		throw new Error( 'Invalid SSM header length' );
+	}
+	const payloadLength = decodeInt( buffer, headerLength, headerLength + Length.PayloadLength );
+	if ( payloadLength !== buffer.length - headerLength - Length.PayloadLength ) {
+		throw new Error( 'Invalid SSM payload length' );
+	}
 	const payloadBytes = buffer.slice( headerLength + Length.PayloadLength );
+	const digest = sha256.update( payloadBytes ).digest();
+	if ( payloadLength !== 0 && ! digest.every( ( byte, index ) => byte === buffer[ Offset.PayloadDigest + index ] ) ) {
+		throw new Error( 'Invalid SSM payload digest' );
+	}
+	if ( ! Number.isSafeInteger( decodeInt( buffer, Offset.SequenceNumber, Offset.SequenceNumber + Length.SequenceNumber ) ) ) {
+		throw new Error( 'SSM sequence number exceeds JavaScript integer precision' );
+	}
 	return {
-		MessageType: decodeText( buffer, Offset.MessageType, Offset.MessageType + Length.MessageType ).trimEnd() as MessageType,
+		MessageType: messageType,
 		SequenceNumber: decodeInt( buffer, Offset.SequenceNumber, Offset.SequenceNumber + Length.SequenceNumber ),
 		MessageId: decodeUuid( buffer, Offset.MessageId, Offset.MessageId + Length.MessageId ),
 		PayloadType: decodeInt( buffer, Offset.PayloadType, Offset.PayloadType + Length.PayloadType ),
@@ -180,7 +204,8 @@ export function decode( buffer: Uint8Array ): AgentMessage {
 	};
 }
 
-export type EncodeableAgentMessage = Omit<AgentMessage, 'MessageId' | 'PayloadBytes'> & {
+export type EncodeableAgentMessage = Omit<AgentMessage, 'MessageId' | 'PayloadBytes' | 'Payload'> & {
+	Payload: string | Uint8Array;
 	// Packed control flags (see header notes above). Defaults to 0, which is
 	// what the reference client sends for all data messages; it uses 3 for
 	// acknowledgements.
@@ -193,7 +218,7 @@ export type EncodeableAgentMessage = Omit<AgentMessage, 'MessageId' | 'PayloadBy
 export function encode( message: EncodeableAgentMessage ) {
 	// Encode the payload to UTF-8 first; the length, digest, and bytes on the
 	// wire must all be computed from the same byte sequence.
-	const payload = new TextEncoder().encode( message.Payload );
+	const payload = typeof message.Payload === 'string' ? new TextEncoder().encode( message.Payload ) : message.Payload;
 	const payloadLength = payload.length;
 	const totalLength = Offset.Payload + payloadLength;
 
