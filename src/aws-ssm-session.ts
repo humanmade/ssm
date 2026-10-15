@@ -11,7 +11,7 @@ export { PayloadTypeFlag } from './channel-messages';
 export { HandshakeRequestPayload, HandshakeResponsePayload } from './handshake';
 
 // Sent to the agent in handshake responses. Keep in sync with package.json.
-const CLIENT_VERSION = '0.0.3';
+const CLIENT_VERSION = '0.0.4';
 
 // Maximum number of out-of-order inbound messages held while waiting for the
 // gap before them to be filled. Matches the reference client's
