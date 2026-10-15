@@ -19,7 +19,11 @@ export type AgentMessage = {
 	MessageId: string;
 	// PayloadDigest: string;
 	PayloadType: PayloadType;
-	Payload: Uint8Array;
+	// The payload decoded as UTF-8 text; JSON payloads are parsed from this.
+	Payload: string;
+	// The raw payload bytes. Use these for binary-safe handling, or for
+	// streaming text decoding across message boundaries.
+	PayloadBytes: Uint8Array;
 }
 
 // HL - HeaderLength is a 4 byte integer that represents the header length.
@@ -66,7 +70,11 @@ enum Offset {
 }
 
 /**
- * Decode a UTF-8 byte sequence to a string.
+ * Decode a padded fixed-width header field to a string.
+ *
+ * Header fields may be padded with NULs or spaces depending on the sender,
+ * so strip NULs here (and trim whitespace at the call site). Not for use on
+ * the payload, where every byte is meaningful.
  */
 function decodeText( buffer: Uint8Array, start: number, end?: number ) {
 	const decoder = new TextDecoder( 'utf8' );
@@ -74,11 +82,6 @@ function decodeText( buffer: Uint8Array, start: number, end?: number ) {
 
 	// Strip errant NULs.
 	return decoded.replace( /\0/g, '' );
-}
-
-function decodeBytes( buffer: Uint8Array, start: number, end?: number ) {
-	const decoder = new TextDecoder( 'utf8' );
-	return decoder.decode( buffer.slice( start, end ) );
 }
 
 function putString( buffer: Uint8Array, start: number, end: number, value: string ) {
@@ -97,9 +100,11 @@ function putString( buffer: Uint8Array, start: number, end: number, value: strin
  * Decode a byte sequence to an integer.
  */
 function decodeInt( buffer: Uint8Array, start: number, end: number ) {
+	// Multiply rather than shift; shifts operate on 32-bit integers, which
+	// would wrap when decoding 8-byte fields. Exact for values below 2^53.
 	const bytes = buffer.slice( start, end );
 	return bytes.reduce( ( acc, byte ) => {
-		return ( acc << 8 ) + byte;
+		return ( acc * 0x100 ) + byte;
 	}, 0 )
 }
 
@@ -120,11 +125,12 @@ function putInt( buffer: Uint8Array, pos: number, value: number ) {
 /**
  * Encode a (64-bit) long into a byte sequence.
  *
- * We cheat here; JS doesn't support 64-bit integers (aka longs), so we can
- * just use putInt with a 4 byte offset.
+ * JS numbers are doubles, so this is exact for values up to 2^53 - 1; that
+ * comfortably covers epoch milliseconds and sequence numbers.
  */
 function putLong( buffer: Uint8Array, pos: number, value: number ) {
-	putInt( buffer, pos + 4, value );
+	putInt( buffer, pos, Math.floor( value / 0x100000000 ) );
+	putInt( buffer, pos + 4, value >>> 0 );
 }
 
 /**
@@ -162,25 +168,59 @@ function longToHex( buffer: Uint8Array ) {
  * Decode a message.
  */
 export function decode( buffer: Uint8Array ): AgentMessage {
+	if ( buffer.length < Offset.Payload ) {
+		throw new Error( 'Truncated SSM message header' );
+	}
+	const messageType = decodeText( buffer, Offset.MessageType, Offset.MessageType + Length.MessageType ).trimEnd() as MessageType;
+	// MGS publication controls may have zeroed header metadata. AWS skips
+	// payload validation for these messages; they carry no application data.
+	if ( messageType === MessageType.StartPublicationMessage || messageType === MessageType.PausePublicationMessage ) {
+		return { MessageType: messageType, SequenceNumber: 0, MessageId: decodeUuid( buffer, Offset.MessageId, Offset.MessageId + Length.MessageId ),
+			PayloadType: 0, Payload: '', PayloadBytes: new Uint8Array() };
+	}
 	const headerLength = decodeInt( buffer, Offset.HL, Offset.HL + Length.HL );
-
+	if ( headerLength < Offset.PayloadLength || headerLength + Length.PayloadLength > buffer.length ) {
+		throw new Error( 'Invalid SSM header length' );
+	}
+	const payloadLength = decodeInt( buffer, headerLength, headerLength + Length.PayloadLength );
+	if ( payloadLength !== buffer.length - headerLength - Length.PayloadLength ) {
+		throw new Error( 'Invalid SSM payload length' );
+	}
+	const payloadBytes = buffer.slice( headerLength + Length.PayloadLength );
+	const digest = sha256.update( payloadBytes ).digest();
+	if ( payloadLength !== 0 && ! digest.every( ( byte, index ) => byte === buffer[ Offset.PayloadDigest + index ] ) ) {
+		throw new Error( 'Invalid SSM payload digest' );
+	}
+	if ( ! Number.isSafeInteger( decodeInt( buffer, Offset.SequenceNumber, Offset.SequenceNumber + Length.SequenceNumber ) ) ) {
+		throw new Error( 'SSM sequence number exceeds JavaScript integer precision' );
+	}
 	return {
-		MessageType: decodeText( buffer, Offset.MessageType, Offset.MessageType + Length.MessageType ).trimEnd() as MessageType,
+		MessageType: messageType,
 		SequenceNumber: decodeInt( buffer, Offset.SequenceNumber, Offset.SequenceNumber + Length.SequenceNumber ),
 		MessageId: decodeUuid( buffer, Offset.MessageId, Offset.MessageId + Length.MessageId ),
 		PayloadType: decodeInt( buffer, Offset.PayloadType, Offset.PayloadType + Length.PayloadType ),
-		Payload: buffer.slice( headerLength + Length.PayloadLength ),
+		Payload: new TextDecoder( 'utf8' ).decode( payloadBytes ),
+		PayloadBytes: payloadBytes,
 	};
 }
 
-export type EncodeableAgentMessage = Omit<AgentMessage, 'MessageId'>;
+export type EncodeableAgentMessage = Omit<AgentMessage, 'MessageId' | 'PayloadBytes' | 'Payload'> & {
+	Payload: string | Uint8Array;
+	// Packed control flags (see header notes above). Defaults to 0, which is
+	// what the reference client sends for all data messages; it uses 3 for
+	// acknowledgements.
+	Flags?: number;
+};
 
 /**
  * Encode a message.
  */
 export function encode( message: EncodeableAgentMessage ) {
-	const payloadLength = message.Payload.length;
-	const totalLength = Offset.PayloadLength + payloadLength + 4;
+	// Encode the payload to UTF-8 first; the length, digest, and bytes on the
+	// wire must all be computed from the same byte sequence.
+	const payload = typeof message.Payload === 'string' ? new TextEncoder().encode( message.Payload ) : message.Payload;
+	const payloadLength = payload.length;
+	const totalLength = Offset.Payload + payloadLength;
 
 	// | HL|         MessageType           |Ver|  CD   |  Seq  | Flags |
 	// |         MessageId                     |           Digest              |PayType| PayLen|
@@ -192,18 +232,22 @@ export function encode( message: EncodeableAgentMessage ) {
 	putInt( data, Offset.SchemaVersion, 1 );
 	putLong( data, Offset.CreatedDate, Date.now() );
 	putLong( data, Offset.SequenceNumber, message.SequenceNumber );
-	putLong( data, Offset.Flags, message.SequenceNumber > 0 ? 0b00 : 0b01 );
+	putLong( data, Offset.Flags, message.Flags ?? 0 );
 
-	// Generate a UUID.
-	uuidv4( {}, data, Offset.MessageId );
+	// Generate a UUID. The wire format stores the least-significant 8 bytes
+	// first, then the most-significant 8 (see decodeUuid), so flip the halves.
+	const messageId = new Uint8Array( 16 );
+	uuidv4( {}, messageId, 0 );
+	data.set( messageId.subarray( 8, 16 ), Offset.MessageId );
+	data.set( messageId.subarray( 0, 8 ), Offset.MessageId + 8 );
 
 	// Generate the digest.
-	data.set( sha256.update( message.Payload ).digest(), Offset.PayloadDigest );
+	data.set( sha256.update( payload ).digest(), Offset.PayloadDigest );
 
 	// Set the payload.
 	putInt( data, Offset.PayloadType, message.PayloadType );
 	putInt( data, Offset.PayloadLength, payloadLength );
-	data.set( message.Payload, Offset.Payload );
+	data.set( payload, Offset.Payload );
 
 	return data;
 }
